@@ -197,6 +197,77 @@ describe('AwsLogsAdapter queryLogs', () => {
         expect(result.status).toBe('Running')
     })
 
+    test('concurrent calls for the same group/query/duration share one StartQuery', async () => {
+        const {client, calls} = stubClient({
+            StartQueryCommand: () => ({queryId: 'q-shared'}),
+            GetQueryResultsCommand: () => ({status: 'Complete', results: [[{field: '@message', value: 'hi'}]]}),
+        })
+        const adapter = new AwsLogsAdapter(client)
+        const input = {queryString: 'fields @message', startTime: 1000, endTime: 4600}
+
+        const [first, second] = await Promise.all([
+            adapter.queryLogs('/floci/probe', input),
+            adapter.queryLogs('/floci/probe', input),
+        ])
+
+        expect(first).toEqual(second)
+        expect(calls.filter((call) => call.command === 'StartQueryCommand')).toHaveLength(1)
+    })
+
+    test('a resumable (still-running) query is polled again, not restarted, on the next call', async () => {
+        let getCalls = 0
+        const {client, calls} = stubClient({
+            StartQueryCommand: () => ({queryId: 'q-resume'}),
+            GetQueryResultsCommand: () => {
+                getCalls += 1
+                if (getCalls === 1) return {status: 'Running', results: []}
+                return {status: 'Complete', results: [[{field: '@message', value: 'finished'}]]}
+            },
+        })
+        // timeoutMs: 0 means each call's own poll loop only ever gets one
+        // GetQueryResultsCommand before its deadline is already past, so the
+        // first call is guaranteed to observe 'Running' rather than racing its
+        // own retries past it before the second call ever happens.
+        const adapter = new AwsLogsAdapter(client, {timeoutMs: 0, intervalMs: 1})
+        const input = {queryString: 'fields @message', startTime: 1000, endTime: 4600}
+
+        const first = await adapter.queryLogs('/floci/probe', input)
+        const second = await adapter.queryLogs('/floci/probe', input)
+
+        expect(first.status).toBe('Running')
+        expect(second).toEqual({queryId: 'q-resume', status: 'Complete', rows: [{'@message': 'finished'}]})
+        expect(calls.filter((call) => call.command === 'StartQueryCommand')).toHaveLength(1)
+    })
+
+    test('a completed query is reused for an identical repeat call instead of re-running it', async () => {
+        const {client, calls} = stubClient({
+            StartQueryCommand: () => ({queryId: 'q-done'}),
+            GetQueryResultsCommand: () => ({status: 'Complete', results: [[{field: '@message', value: 'once'}]]}),
+        })
+        const adapter = new AwsLogsAdapter(client)
+        const input = {queryString: 'fields @message', startTime: 1000, endTime: 4600}
+
+        await adapter.queryLogs('/floci/probe', input)
+        await adapter.queryLogs('/floci/probe', input)
+
+        expect(calls.filter((call) => call.command === 'StartQueryCommand')).toHaveLength(1)
+        expect(calls.filter((call) => call.command === 'GetQueryResultsCommand')).toHaveLength(1)
+    })
+
+    test('a different query string or time range never reuses another query\'s cache entry', async () => {
+        const {client, calls} = stubClient({
+            StartQueryCommand: () => ({queryId: `q-${calls.length}`}),
+            GetQueryResultsCommand: () => ({status: 'Complete', results: []}),
+        })
+        const adapter = new AwsLogsAdapter(client)
+
+        await adapter.queryLogs('/floci/probe', {queryString: 'fields @message', startTime: 1000, endTime: 4600})
+        await adapter.queryLogs('/floci/probe', {queryString: 'fields @timestamp', startTime: 1000, endTime: 4600})
+        await adapter.queryLogs('/floci/probe', {queryString: 'fields @message', startTime: 1000, endTime: 22600})
+
+        expect(calls.filter((call) => call.command === 'StartQueryCommand')).toHaveLength(3)
+    })
+
     test('rejects a blank query string before calling the runtime', async () => {
         const {client, calls} = stubClient({})
         const adapter = new AwsLogsAdapter(client)
